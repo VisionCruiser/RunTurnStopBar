@@ -1,0 +1,559 @@
+
+///////////////****************//
+#define _title "LightBar v3.01"
+#define _date  9.28.23
+#define _version v3.01
+
+/*
+ *  trailer 4 wire harness standard:
+ *  [1] White = Gnd
+ *  [2] Brown = Running light
+ *  [3] Green = Right / stop ; "g[R]een"
+ *  [4] Yellow = Left / stop ; "ye[L]low"
+ *  
+ *  [5] Blue = Brake controller Output
+ *  [6] Purple = Auxiliary 12v/reverse lights/reverse lockout for trailer brakes
+ *  [7] Black = 12v Battery power
+ * 
+ *  Keryakyn 4710:
+ *    inputs:
+ *  LEFT turn power
+ *  RIGHT turn power
+ *  BRAKE light power
+ * 
+ *    Outputs:
+ *  BLACK = Ground
+ *  BLUE = Run
+ *  RED=Brake
+ *  BROWN=Right Turn
+ *  VIOLET=Left Turn
+ * 
+*/
+
+//  Hardware Key Locations   //
+
+
+//  Segment points around the luggage rack
+
+const byte L0 = 0;  //   L1__   __R1
+const byte L1 = 9;  //   | L0 R0 |
+const byte L2 = 48; //   |       |
+const byte L3 = 71; // L2\___ ___/R2
+const byte R3 = 36; //     L3 R3
+const byte R2 = 95;
+const byte R1 = 134;
+const byte R0 = 143;
+
+//  Segmented points around luggage rack supporting brackets
+
+const byte Lend = 0;    //      L_end  R_end
+const byte Lcrv = 22;   //        |     |
+const byte Lctr = 35;   //        |     |
+const byte Rctr = 36;   //  L_crv \__ __/ R_crv
+const byte Rcrv = 49;   //      L_ctr R_ctr
+const byte Rend = 71;
+
+// byte LstartLed = Rend;
+// byte LendLed = Lend;
+// byte RstartLed = Lend;
+// byte RendLed = Rend;
+
+// Masks      Key LEDS on "corners" around the rack  [ 0, 9, 48, 71 ][ 72, 95, 134, 143 ][ 1/16, 1/3, 1/2 ]
+// byte mask_Brakes[NUM_LEDS];     //  Rear 100%, sides fade toward front
+// byte mask_Left[NUM_LEDS];       //  R2 - L1
+// byte mask_Right[NUM_LEDS];      //  L2 - R1
+// byte mask_Lside[NUM_LEDS];      //  L3 - L0
+// byte mask_rside[NUM_LEDS];      //  R3 - R0
+
+
+// Segmented points around Trunk
+
+const byte TL0 = 0;  //  L0          R0
+const byte TL1 = 9;  //   |           |
+const byte TL2 = 48; //   \           /
+const byte TL3 = 71; //  L1\__ ___ __/R1
+const byte TR3 = 36; //     L2  v  R2
+const byte TR2 = 95;
+const byte TR1 = 134;
+const byte TR0 = 143;
+
+
+#include <Wire.h>
+#include <EEPROM.h>
+#include <FastLED.h>
+#include <Adafruit_RGBLCDShield.h>
+#include <utility/Adafruit_MCP23017.h>
+
+
+/////////////////////////////////////
+/////    Hardware Assignments   /////
+/////////////////////////////////////
+#define MAX_POWER_MILLIAMPS 2700
+#define NUM_LEDS            72
+
+#define LED_PIN             2 // Output to physical LED strip
+#define RUN_PIN             3 // Brown
+#define RIGHT_PIN           4 // Yellow
+#define LEFT_PIN            5 // Green
+#define BRAKES_PIN          6 // green
+#define EMERG_PIN           7
+#define REVERSE_PIN         8
+#define DASH_L_PIN          9
+#define DASH_H_PIN          10
+
+
+///////////////////////////////////////////////
+//////////  BitMapped inputRegister  //////////
+///////////////////////////////////////////////
+#define IR_Brakes           0
+#define IR_Reverse          1
+#define IR_Emergency        2
+#define IR_Left             3
+#define IR_Right            4
+#define IR_Run              5
+#define IR_swLow            6
+#define IR_swHigh           7
+
+
+////////////////////////////////////////////
+//////////    Global Variables    //////////
+////////////////////////////////////////////
+byte inputRegister; // BitMapped Status
+byte turnSet  = 1;  // is this even used?
+byte FadeTime = 20;
+bool BusyLeftTurn;
+bool BusyRightTurn;
+
+Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
+CRGB leds[NUM_LEDS];        // Virtual LED arrays 
+CHSV ledsBrakes[NUM_LEDS];  // Note: HSV 
+CRGB ledsTurn[NUM_LEDS];
+CHSV ledsRun[NUM_LEDS];     // Note: HSV
+
+
+CRGBSet ledsSegment(ledsTurn, NUM_LEDS);
+CRGBSet ledsGrp1(ledsSegment(NUM_LEDS/8*0, NUM_LEDS/8*1-1));
+CRGBSet ledsGrp2(ledsSegment(NUM_LEDS/8*1, NUM_LEDS/8*2-1));
+CRGBSet ledsGrp3(ledsSegment(NUM_LEDS/8*2, NUM_LEDS/8*3-1));
+CRGBSet ledsGrp4(ledsSegment(NUM_LEDS/8*3, NUM_LEDS/8*4-1));
+CRGBSet ledsGrp5(ledsSegment(NUM_LEDS/8*4, NUM_LEDS/8*5-1));
+CRGBSet ledsGrp6(ledsSegment(NUM_LEDS/8*5, NUM_LEDS/8*6-1));
+CRGBSet ledsGrp7(ledsSegment(NUM_LEDS/8*6, NUM_LEDS/8*7-1));
+CRGBSet ledsGrp8(ledsSegment(NUM_LEDS/8*7, NUM_LEDS/8*8-1));
+
+CRGBSet ledsGrpL(ledsSegment(NUM_LEDS/2*0, NUM_LEDS/2));    // Left Half
+CRGBSet ledsGrpR(ledsSegment(NUM_LEDS/2*1, NUM_LEDS/2));    // Right Half
+struct CRGB *ledsGrp[]={ledsGrp1,ledsGrp2,ledsGrp3,ledsGrp4,ledsGrp5,ledsGrp6,ledsGrp7,ledsGrp8,ledsGrpL,ledsGrpR};
+
+
+
+// Turn Settings vars
+CRGB TurnColor1;
+CRGB TurnColor2; 
+byte spriteLength;
+byte TurnTime = 0;
+bool turnTails;        // Fade tails on Turn signals?
+
+
+///////////////////////////////////////////
+//////////  Save & Load Settings  /////////
+///////////////////////////////////////////
+void SaveSettings()
+{
+  int address = 0;
+  EEPROM.update(address, turnSet);
+}
+  
+//////////  Load preferred settings  ////////
+void loadSettings()
+{
+  long prevMillis=millis();
+  // byte turnSet=1;
+  lcd.setBacklight(0x7);
+    lcd.clear();
+    lcd.print(_title);
+    delay(2500);
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Select Style 1-6");
+    lcd.setCursor(1,1);
+    lcd.print(turnSet);
+    byte buttons = lcd.readButtons();
+  do 
+  {
+    buttons = lcd.readButtons();
+    if (buttons)
+    {
+      if (buttons & BUTTON_UP) turnSet++;
+      if (buttons & BUTTON_DOWN) turnSet--;
+      turnSet = constrain(turnSet,1,6);
+      lcd.setCursor(1,1);
+      lcd.print(turnSet);
+      prevMillis=millis();
+      delay(200);
+    }
+    if (millis()-prevMillis>=7000)
+    {
+      turnSet=3;
+      break;
+    }
+  } while((buttons & BUTTON_SELECT) == 0);
+
+  lcd.clear();
+  lcd.setBacklight(0x2);
+  // lcd.noDisplay();
+
+  switch (turnSet)
+  {
+    case 1: // ******* Set T1 *********
+    TurnColor1 =       CRGB::OrangeRed;
+    TurnColor2 =       CRGB::Black; 
+    spriteLength =  NUM_LEDS/2;
+    turnTails = true;                                        // Fade tails on Turn signals?
+    FadeTime = 20;
+    break;
+
+    case 2: // ******* Set T2 *********
+    TurnColor1 =       CRGB::Yellow;
+    TurnColor2 =       CRGB::Black; 
+    spriteLength =  NUM_LEDS/2;
+    turnTails = false;                                        // Fade tails on Turn signals?
+    FadeTime = 20;
+    break;
+
+    case 3: //********  Set T3 ********    
+    TurnColor1 =       CRGB::Orange;
+    TurnColor2 =       CRGB::Orange; 
+    spriteLength =  NUM_LEDS/3;
+    turnTails = true;                                        // Fade tails on Turn signals?
+    FadeTime = 25;
+    break;
+
+    case 4: //********  Set T4 ********    
+    TurnColor1 =       CRGB::Orange;
+    TurnColor2 =       CRGB::Orange; 
+    spriteLength =  NUM_LEDS/2;
+    turnTails = true;                                        // Fade tails on Turn signals?
+    FadeTime = 35;
+    break;
+
+    case 5: //********  Set T5 ********    
+    TurnColor1 =       CRGB::Yellow;
+    TurnColor2 =       CRGB::Orange; 
+    spriteLength =  NUM_LEDS/24;
+    turnTails = true;                                        // Fade tails on Turn signals?
+    FadeTime = 35;
+    break;    
+
+    case 6: //********  Set T6 ********    
+    TurnColor1 =       CRGB::OrangeRed;
+    TurnColor2 =       CRGB::Black; 
+    spriteLength =  NUM_LEDS/12;
+    turnTails = false;                                        // Fade tails on Turn signals?
+    FadeTime = 20;
+    break;    
+  }
+  for (byte i = 1; i<= turnSet; i++)
+  {
+    fill_solid(leds, NUM_LEDS, CRGB::Navy);       // Number of Flashes on LEDs = TurnSetting
+    FastLED.show();
+    delay(200);
+    FastLED.clear();
+    FastLED.show();
+    delay(150);
+  }
+}
+
+
+////////////////////////////////////////
+/////// Enter Configuration Mode ///////
+////////////////////////////////////////
+
+void EnterConfigMode()
+{
+  /*
+  // sequence match to enter ConfigMode
+  //  RIGHT,LEFT,RIGHT,LEFT,BRAKE
+  // within 3 seconds
+  
+  // match with array of sequence values
+  // byte configSequence[] : {Left, Right, Left, Right, Brakes}
+  // Does input match next sequence?
+  // YES, increment sequence counter
+  // NO, reset timer
+
+  byte ConfigMatchEntry(input);
+  {
+    if input != previousInput { add entry to logArray}
+    if input == brakes { is timestamp - logArray(0) timestamp < 3 seconds?}
+  }
+  
+  */
+}
+
+
+/////////////////////////////////////////
+///////////   Setup & Loop   ////////////
+/////////////////////////////////////////
+void setup()
+{
+  lcd.begin(16,2);
+  
+// Hardware Inputs (7-point RV connector)
+  pinMode(RIGHT_PIN,  INPUT);
+  pinMode(LEFT_PIN,   INPUT);
+  pinMode(BRAKES_PIN, INPUT);
+  pinMode(DASH_L_PIN, INPUT);
+  pinMode(DASH_H_PIN, INPUT);
+//pinMode(RUN_PIN,    INPUT);
+//pinMode(REVERSE_PIN,INPUT);
+//pinMode(EMERG_PIN,  INPUT);
+
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  set_max_power_in_volts_and_milliamps(5, MAX_POWER_MILLIAMPS);
+  set_max_power_indicator_LED(13);
+
+  loadSettings();
+  Serial.begin(9600);
+}
+
+void loop()
+{
+  EVERY_N_MILLISECONDS(150) readInputs();
+  processArrays();
+  render();
+}
+
+
+//////////////////////////////////
+///////   Read Inputs to   ///////
+///////   inputRegister    ///////
+//////////////////////////////////
+void readInputs()
+{
+
+//bitWrite(inputRegister, IR_Run,       (digitalRead(RUN_PIN)                               ));
+//bitWrite(inputRegister, IR_Reverse,   (digitalRead(REVERSE_PIN)                           ));
+  bitWrite(inputRegister, IR_Brakes,    (digitalRead(BRAKES_PIN)                            ));
+  bitWrite(inputRegister, IR_Left,      (digitalRead(LEFT_PIN)  && !digitalRead(RIGHT_PIN)  ));
+  bitWrite(inputRegister, IR_Right,     (digitalRead(RIGHT_PIN) && !digitalRead(LEFT_PIN)   ));
+  bitWrite(inputRegister, IR_swLow,     (digitalRead(DASH_L_PIN)                            ));
+  bitWrite(inputRegister, IR_swHigh,    (digitalRead(DASH_H_PIN)                            ));
+}                                              
+
+
+/////////////////////////////////////
+/////////  Process Status  //////////
+/////////////////////////////////////
+
+void processArrays()
+{
+  Brakes();                                                   // Animated, always poll for status
+  Left();
+  Right();
+}
+
+////////////////////////////////////
+/////////  Update Virtual //////////
+/////////    LED Arrays   //////////
+////////////////////////////////////
+
+void Brakes()                                                 // Self-driving array open and closing animation using "ticBrakes" heartbeat
+{
+  static byte ticBrakes =0;
+  
+  EVERY_N_MILLISECONDS(1)
+  {
+    byte stepBrakes = constrain(ticBrakes, 0, NUM_LEDS/2); // stepBrakes never exceeds LEDSs
+    ticBrakes = constrain(ticBrakes, 0, NUM_LEDS/2 +1);       // when LEDs are full, more tic room for "aftereffects"  
+      
+    if (bitRead(inputRegister, IR_Brakes))
+    {
+      ledsBrakes[NUM_LEDS/2 + stepBrakes-1] = CHSV(0,255,255);
+      ledsBrakes[NUM_LEDS/2 - stepBrakes] = CHSV(0,255,255);
+      ticBrakes++;
+    }
+    if ((bitRead(inputRegister, IR_Brakes)== 0) && (ticBrakes>0))
+    {
+      ledsBrakes[NUM_LEDS/2 + stepBrakes-1] = CHSV(0,0,0);
+      ledsBrakes[NUM_LEDS/2 - stepBrakes] = CHSV(0,0,0);
+      ticBrakes--;
+    }
+    if (ticBrakes >= NUM_LEDS/2 ) addGlitter(24);              //percent chance of glitter at each pixel
+  }
+}
+
+void Left()
+{
+  static byte animTicL = 0;
+  if (( BusyLeftTurn == 0 ) && ( bitRead(inputRegister, IR_Left) )); //||(bitRead(inputRegister,IR_Emergency))))               // New Turn - Reset
+  {
+    animTicL = 0;
+    BusyLeftTurn = 1;
+  }
+  
+  if (BusyLeftTurn == 1)
+  {
+    EVERY_N_MILLISECONDS(TurnTime)
+    {    
+      byte spriteHead=constrain(animTicL, startLed, endLed);
+      byte spriteTail=spriteHead-spriteLength;
+      spriteTail=constrain(animTicL-spriteLength, startLed, endLed);
+
+      ledsTurn[endLed-spriteHead]=TurnColor1;
+      ledsTurn[endLed-spriteTail]=TurnColor2;
+
+      if (animTicL >= ((endLed-startLed)+spriteLength-1)) BusyLeftTurn = 0;
+      animTicL ++;
+    }
+  }
+}
+
+void Right()
+{
+  static byte animTicR = 0;
+  if ((BusyRightTurn == 0) && ( bitRead(inputRegister, IR_Right) )); //||(bitRead(inputRegister,IR_Emergency))))
+  {
+    animTicR = 0;
+    BusyRightTurn = 1;
+  }
+  
+  if (BusyRightTurn == 1)
+  {
+    EVERY_N_MILLISECONDS(TurnTime)
+    {    
+      byte spriteHead=constrain(animTicR, 0, NUM_LEDS-1);
+      byte spriteTail=spriteHead-spriteLength;
+      spriteTail=constrain(animTicR-spriteLength, 0, NUM_LEDS-1);
+
+      ledsTurn[spriteHead]=TurnColor1;
+      ledsTurn[spriteTail]=TurnColor2;
+      if (animTicR >= (NUM_LEDS+spriteLength-1)) BusyRightTurn = 0;
+      animTicR ++;
+    }
+  }
+}
+
+
+
+void Emergency()
+{
+  static uint8_t ticEmergency =0;
+  uint8_t phase;
+  
+  EVERY_N_MILLISECONDS(35)
+  {
+    if (bitRead(inputRegister, IR_Emergency))
+    { 
+      CRGB color0 = CRGB::Black;
+      CRGB color1 = CRGB::Yellow;
+      CRGB color2 = CRGB::Black;
+
+      if(ticEmergency <5) phase=1;                               // Even ON
+      else if(ticEmergency ==5) phase=0;                         // all OFF
+      else if((ticEmergency >5 )&& (ticEmergency <10)) phase=1;  // Even ON
+      else if(ticEmergency ==10) phase=0;                        // all OFF
+      else if((ticEmergency >10) && (ticEmergency <16)) phase=1; // Even ON
+      else if(ticEmergency ==16) phase=0;
+      else if((ticEmergency >=17) && (ticEmergency<23)) phase=2; // Odd ON
+      else if(ticEmergency ==23) phase=0;                        // all OFF
+      else if((ticEmergency >23) && (ticEmergency <28)) phase=2; // Odd ON
+      else if(ticEmergency ==28) phase=0;                        // all OFF
+      else if((ticEmergency >28) && (ticEmergency <34)) phase=2; // Odd ON
+      else if(ticEmergency ==34) phase=0;
+      else ticEmergency =0;
+      
+      ticEmergency++;
+
+      switch(phase)
+      {
+        case 0:
+        fill_solid(ledsGrp[0], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[1], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[2], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[3], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[4], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[5], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[6], NUM_LEDS/8, color0);
+        fill_solid(ledsGrp[7], NUM_LEDS/8, color0);
+        break;
+
+        case 1:
+        fill_solid(ledsGrp[0], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[1], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[2], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[3], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[4], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[5], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[6], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[7], NUM_LEDS/8, color2);
+        break;
+
+        case 2:
+        fill_solid(ledsGrp[0], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[1], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[2], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[3], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[4], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[5], NUM_LEDS/8, color1);
+        fill_solid(ledsGrp[6], NUM_LEDS/8, color2);
+        fill_solid(ledsGrp[7], NUM_LEDS/8, color1);
+        break;
+      }
+    }
+  }
+}
+
+
+///////////////////////////////////////
+////////  Run (inactive mode)  ////////
+///////////////////////////////////////
+
+void Run()
+{
+  // run mode goes here
+} 
+
+
+/////////////////////////////////////////////////////
+////   Render virtual arrays to the LIGHT BAR    ////
+/////////////////////////////////////////////////////
+
+void render()
+{  
+  if(turnTails) fadeToBlackBy(ledsTurn, NUM_LEDS, FadeTime);
+ 
+  CRGB alphaReplace = CRGB::Black;
+  
+  for (byte i = 0; i < NUM_LEDS; i++)
+  {
+
+    if (ledsTurn[i] == alphaReplace) leds[i] = ledsBrakes[i];
+    else leds[i] = ledsTurn[i];
+
+    if ((bitRead(inputRegister, IR_Reverse)) && (leds[i] == alphaReplace))
+    {
+      leds[i] = CRGB::White;
+    }
+    if ((bitRead(inputRegister, IR_Reverse)) && ((i<NUM_LEDS/6) || (i>NUM_LEDS/6*5)))
+    {
+      leds[i]=CRGB::White;
+    }
+  }
+  FastLED.show();
+}
+
+
+////////////////////////////////////
+/////////  Graphic Effects /////////
+////////////////////////////////////
+
+void addGlitter(fract8 chanceOfGlitter) 
+{
+  int x = random16(NUM_LEDS);
+  static int prevX;
+  CHSV prevColor=ledsBrakes[x];
+  ledsBrakes[prevX]=CHSV(prevColor);
+  if (random8() < chanceOfGlitter) ledsBrakes[x] = CHSV(0,0,255);
+  prevX=x;
+}
